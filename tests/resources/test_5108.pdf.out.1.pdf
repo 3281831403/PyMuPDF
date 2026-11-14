@@ -1,0 +1,55 @@
+%PDF-1.7
+%µ¶
+% Written by MuPDF 1.28.6
+
+1 0 obj
+<</Type/Catalog/Pages 2 0 R>>
+endobj
+
+2 0 obj
+<</Type/Pages/Kids[3 0 R]/Count 1>>
+endobj
+
+3 0 obj
+<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 400]/Resources<</Shading<</Sh0 4 0 R>>>>/Contents[5 0 R 6 0 R]>>
+endobj
+
+4 0 obj
+<</ShadingType 2/ColorSpace/DeviceRGB/Coords[210 0 390 0]/Extend[true true]/Function<</FunctionType 2/Domain[0 1]/C0[1 0 0]/C1[0 0 1]/N 1>>>>
+endobj
+
+5 0 obj
+<</Length 41>>
+stream
+q 210 10 180 380 re W n /Sh0 sh Q q Q q Q
+endstream
+endobj
+
+6 0 obj
+<</Length 35>>
+stream
+
+q
+200 0 200 400 re
+h
+1 0 0 RG S
+Q
+
+endstream
+endobj
+
+xref
+0 7
+0000000000 65535 f 
+0000000042 00000 n 
+0000000088 00000 n 
+0000000140 00000 n 
+0000000264 00000 n 
+0000000422 00000 n 
+0000000512 00000 n 
+
+trailer
+<</Size 7/Root 1 0 R/ID[<C28C5EC395C3BBC3BDC383C3B57B6D7E><B8936EE4238587E0D79920F86B9FE6A8>]>>
+startxref
+596
+%%EOF

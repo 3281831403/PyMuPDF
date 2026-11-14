@@ -13,6 +13,8 @@ Fixed issues:
 
 Other:
 
+* Page.get_text(..., sort=True) now uses one shared reading order for all output variants ("text", "words", "blocks", "dict", "json", "rawdict", "rawjson"): two-column pages are read top-to-bottom, left column before right, while single-column text and tables stay top-to-bottom. The sequence is independent of page rotation, the "tolerance" argument now also reaches "words" extraction, and sorting only reorders items without changing text, coordinates, spans or characters.
+
 * Improve upgrade from 1.x to 2.x via pymupdf4llm or pymupdf_layout.
 * Reduced startup time using lazy internal import of large modules.
 * Retrospectively added date of 2.0 release.

@@ -6,6 +6,7 @@
 # lightweight PDF, XPS, and E-book viewer, renderer and toolkit which is
 # maintained and developed by Artifex Software, Inc. https://artifex.com.
 # ------------------------------------------------------------------------
+import json
 import typing
 import weakref
 
@@ -38,12 +39,229 @@ This is a collection of functions to extend PyMupdf.
 """
 
 
+# ------------------------------------------------------------------------
+# Reading-order support for sorted text extraction.
+#
+# All sorted extraction variants ("text", "blocks", "words", "dict", "json",
+# "rawdict", "rawjson") share the following unified ordering logic, so their
+# outputs are mutually consistent. Sorting happens in the coordinate system
+# of the extracted text. Because text extraction internally works on the
+# de-rotated page, this makes the reading sequence independent of the page's
+# /Rotate value.
+# ------------------------------------------------------------------------
+
+
+def _projection_gaps(intervals, min_width):
+    """Find uncovered gaps in the 1-dimensional projection of intervals.
+
+    Args:
+        intervals: list of (start, end) number pairs.
+        min_width: ignore gaps narrower than this.
+    Returns:
+        List of (start, end) gaps not covered by any interval.
+    """
+    gaps = []
+    covered = None
+    for a, b in sorted(intervals):
+        if covered is None:
+            covered = b
+            continue
+        if a > covered and a - covered >= min_width:
+            gaps.append((covered, a))
+        if b > covered:
+            covered = b
+    return gaps
+
+
+def _y_bands(rects, tolerance):
+    """Group rectangles into horizontal bands.
+
+    Rectangles whose vertical distance does not exceed 'tolerance' are
+    merged into the same band. Returns a list of [y0, y1] bands.
+    """
+    bands = []
+    for r in sorted(rects, key=lambda r: (r.y0, r.y1)):
+        if bands and r.y0 <= bands[-1][1] + tolerance:
+            if r.y1 > bands[-1][1]:
+                bands[-1][1] = r.y1
+        else:
+            bands.append([r.y0, r.y1])
+    return bands
+
+
+def _is_column_gutter(left, right, tolerance):
+    """Decide whether a vertical gutter separates two prose columns.
+
+    The gutter must be flanked by text with substantially overlapping
+    vertical extents, and the line structure on both sides must be
+    independent: if the lines on both sides are vertically aligned with
+    each other, we are looking at table rows rather than columns and
+    keep the top-to-bottom sequence.
+    """
+    ly0 = min(r.y0 for r in left)
+    ly1 = max(r.y1 for r in left)
+    ry0 = min(r.y0 for r in right)
+    ry1 = max(r.y1 for r in right)
+    overlap = min(ly1, ry1) - max(ly0, ry0)
+    if overlap < 0.25 * min(ly1 - ly0, ry1 - ry0):
+        return False
+    if len(_y_bands(left, tolerance)) == 1 \
+            and len(_y_bands(right, tolerance)) == 1:
+        # Two solid bands without line structure even when bridging
+        # small gaps: accept as columns only if both are clearly taller
+        # than wide, i.e. column-like. Otherwise this is a single row.
+        lw = max(r.x1 for r in left) - min(r.x0 for r in left)
+        rw = max(r.x1 for r in right) - min(r.x0 for r in right)
+        return (ly1 - ly0) > lw and (ry1 - ry0) > rw
+    # Compare the exact line structure of both sides: columns if the
+    # lines of the smaller side are mostly not mirrored on the other
+    # side (independent text flows), table rows otherwise.
+    lbands = _y_bands(left, 0)
+    rbands = _y_bands(right, 0)
+    small, big = (lbands, rbands) if len(lbands) <= len(rbands) else (rbands, lbands)
+    centers = [(b0 + b1) / 2 for b0, b1 in big]
+    matched = 0
+    for b0, b1 in small:
+        c = (b0 + b1) / 2
+        if any(abs(c - bc) <= tolerance for bc in centers):
+            matched += 1
+    return matched / len(small) < 0.5
+
+
+def _line_sorted(items, tolerance):
+    """Sort (rect, payload) items line-wise, forgiving small deviations."""
+    items = sorted(items, key=lambda it: (it[0].y0, it[0].x0))
+    result = []
+    line = [items[0]]
+    lrect = pymupdf.Rect(items[0][0])
+    for it in items[1:]:
+        r = it[0]
+        if abs(r.y0 - lrect.y0) <= tolerance or abs(r.y1 - lrect.y1) <= tolerance:
+            line.append(it)
+            lrect |= r
+        else:
+            line.sort(key=lambda it: it[0].x0)
+            result.extend(line)
+            line = [it]
+            lrect = pymupdf.Rect(r)
+    line.sort(key=lambda it: it[0].x0)
+    result.extend(line)
+    return result
+
+
+def _split_groups(items, gaps, dim):
+    """Split (rect, payload) items into groups separated by gaps.
+
+    Args:
+        items: list of (pymupdf.Rect, payload) pairs.
+        gaps: sorted list of (start, end) gap intervals.
+        dim: 0 to split along x (columns), 1 to split along y (rows).
+    Returns:
+        List of item lists, in gap-separated order.
+    """
+    segments = [(float("-inf"), gaps[0][0])]
+    for (_, g1), (n0, _) in zip(gaps, gaps[1:]):
+        segments.append((g1, n0))
+    segments.append((gaps[-1][1], float("inf")))
+    groups = [[] for _ in segments]
+    for it in items:
+        r = it[0]
+        center = ((r.x0 + r.x1) if dim == 0 else (r.y0 + r.y1)) / 2
+        for i, (s0, s1) in enumerate(segments):
+            if s0 <= center < s1:
+                groups[i].append(it)
+                break
+        else:  # pragma: no cover - centers never fall into a gap
+            groups[-1].append(it)
+    return groups
+
+
+def _reading_order(items, tolerance=3):
+    """Reorder (rect, payload) items into reading sequence.
+
+    A recursive XY-cut: a region is split into columns at vertical gutters
+    where the text on both sides has independent line structure (prose
+    columns). Otherwise horizontal cuts keep single-column text and tables
+    in top-to-bottom sequence. The smallest regions are sorted line-wise,
+    forgiving vertical deviations up to 'tolerance'.
+    """
+    if len(items) < 2:
+        return items
+    rects = [it[0] for it in items]
+
+    # Look for column gutters in the x-projection.
+    gutters = []
+    for g0, g1 in _projection_gaps(
+            [(r.x0, r.x1) for r in rects], min_width=max(2 * tolerance, 4)):
+        left = [it for it in items if it[0].x1 <= g0]
+        right = [it for it in items if it[0].x0 >= g1]
+        if not left or not right or len(left) + len(right) != len(items):
+            continue  # gutter is crossed by some item
+        if _is_column_gutter(
+                [it[0] for it in left], [it[0] for it in right], tolerance):
+            gutters.append((g0, g1))
+    if gutters:
+        result = []
+        for group in _split_groups(items, gutters, dim=0):
+            result.extend(_reading_order(group, tolerance))
+        return result
+
+    # Split at full-width horizontal whitespace bands.
+    ygaps = _projection_gaps(
+            [(r.y0 - tolerance, r.y1 + tolerance) for r in rects],
+            min_width=0.5)
+    if ygaps:
+        result = []
+        for group in _split_groups(items, ygaps, dim=1):
+            result.extend(_reading_order(group, tolerance))
+        return result
+
+    return _line_sorted(items, tolerance)
+
+
+def _sort_by_reading_order(items, rect_fn, tolerance=3):
+    """Sort items into reading sequence without modifying them.
+
+    Args:
+        items: list of arbitrary objects.
+        rect_fn: callable returning an item's bbox.
+        tolerance: line grouping / column detection tolerance.
+    Returns:
+        The items reordered into reading sequence.
+    """
+    wrapped = [(pymupdf.Rect(rect_fn(it)), it) for it in items]
+    return [it for _, it in _reading_order(wrapped, tolerance)]
+
+
+def _sort_dict_by_reading_order(d, tolerance=3):
+    """Reorder blocks, lines and spans of a dict extraction in place.
+
+    Uses the same reading-order logic as all other sorted extraction
+    variants. Only the sequence of blocks, lines and spans is changed;
+    no content is added, modified or removed.
+    """
+    blocks = d.get("blocks")
+    if not blocks:
+        return
+    d["blocks"] = _sort_by_reading_order(blocks, lambda b: b["bbox"], tolerance)
+    for b in d["blocks"]:
+        lines = b.get("lines")
+        if not lines:
+            continue
+        b["lines"] = _sort_by_reading_order(lines, lambda l: l["bbox"], tolerance)
+        for l in b["lines"]:
+            spans = l.get("spans")
+            if spans and len(spans) > 1:
+                spans.sort(key=lambda s: s["bbox"][0])
+
+
 def get_text_blocks(
     page: pymupdf.Page,
     clip: rect_like = None,
     flags: OptInt = None,
     textpage: pymupdf.TextPage = None,
     sort: bool = False,
+    tolerance=3,
 ) -> list:
     """Return the text blocks on a page.
 
@@ -51,6 +269,9 @@ def get_text_blocks(
         Lines in a block are concatenated with line breaks.
     Args:
         flags: (int) control the amount of data parsed into the textpage.
+        sort: (bool) sort the blocks in reading sequence.
+        tolerance: (float) line grouping / column detection tolerance.
+            Relevant only if sort=True.
     Returns:
         A list of the blocks. Each item contains the containing rectangle
         coordinates, text lines, running block number and block type.
@@ -65,10 +286,32 @@ def get_text_blocks(
         raise ValueError("not a textpage of this page")
 
     blocks = tp.extractBLOCKS()
+    if sort and blocks:
+        # Unify the reading order with the other extraction variants:
+        # reorder the blocks and the lines inside them. The dict
+        # extraction of the same textpage provides the line structure;
+        # block numbers are identical in both extractions.
+        d = tp.extractDICT()
+        _sort_dict_by_reading_order(d, tolerance)
+        by_number = {b[5]: b for b in blocks}
+        sorted_blocks = []
+        for db in d["blocks"]:
+            b = by_number.get(db["number"])
+            if b is None:
+                continue
+            if db["type"] == 0:  # text block: lines may have been reordered
+                text = "".join(
+                        "".join(s["text"] for s in line["spans"]) + "\n"
+                        for line in db["lines"])
+                b = (b[0], b[1], b[2], b[3], text, b[5], b[6])
+            sorted_blocks.append(b)
+        # defensive: keep any blocks not present in the dict extraction
+        if len(sorted_blocks) < len(blocks):
+            seen = {b[5] for b in sorted_blocks}
+            sorted_blocks.extend(b for b in blocks if b[5] not in seen)
+        blocks = sorted_blocks
     if textpage is None:
         del tp
-    if sort:
-        blocks.sort(key=lambda b: (b[3], b[0]))
     return blocks
 
 
@@ -98,31 +341,6 @@ def get_text_words(
         Word tuples (x0, y0, x1, y1, "word", bno, lno, wno).
     """
 
-    def sort_words(words):
-        """Sort words line-wise, forgiving small deviations."""
-        words.sort(key=lambda w: (w[3], w[0]))
-        nwords = []  # final word list
-        line = [words[0]]  # collects words roughly in same line
-        lrect = pymupdf.Rect(words[0][:4])  # start the line rectangle
-        for w in words[1:]:
-            wrect = pymupdf.Rect(w[:4])
-            if (
-                abs(wrect.y0 - lrect.y0) <= tolerance
-                or abs(wrect.y1 - lrect.y1) <= tolerance
-            ):
-                line.append(w)
-                lrect |= wrect
-            else:
-                line.sort(key=lambda w: w[0])  # sort words in line l-t-r
-                nwords.extend(line)  # append to final words list
-                line = [w]  # start next line
-                lrect = wrect  # start next line rect
-
-        line.sort(key=lambda w: w[0])  # sort words in line l-t-r
-        nwords.extend(line)  # append to final words list
-
-        return nwords
-
     pymupdf.CheckParent(page)
     if flags is None:
         flags = pymupdf.TEXTFLAGS_WORDS
@@ -145,8 +363,8 @@ def get_text_words(
     if textpage is None:
         del tp
     if words and sort:
-        # advanced sort if any words found
-        words = sort_words(words)
+        # unified reading-order sort, shared by all extraction variants
+        words = _sort_by_reading_order(words, lambda w: w[:4], tolerance)
 
     return words
 
@@ -253,13 +471,13 @@ def get_sorted_text(
     ltext = line_text(totalbox, line)
     lines.append((lrect, ltext))
 
-    # sort all lines vertically
-    lines.sort(key=lambda l: (l[0].y1))
+    # The lines are already in reading sequence (as are the words they
+    # were built from), so no further sorting must happen here.
 
     text = lines[0][1]  # text of first line
     y1 = lines[0][0].y1  # its bottom coordinate
     for lrect, ltext in lines[1:]:
-        distance = min(int(round((lrect.y0 - y1) / lrect.height)), 5)
+        distance = min(max(int(round((lrect.y0 - y1) / lrect.height)), 0), 5)
         breaks = "\n" * (distance + 1)
         text += breaks + ltext
         y1 = lrect.y1
@@ -470,6 +688,14 @@ def get_text(
         flags: bit switches to e.g. exclude images or decompose ligatures.
         textpage: reuse this pymupdf.TextPage and make no new one. If specified,
             'flags' and 'clip' are ignored.
+        sort: (bool) sort output in reading sequence. All sorted variants
+            share the same unified ordering: text columns are read top to
+            bottom, left column first, while single-column text and tables
+            are read top to bottom. The sequence is independent of page
+            rotation.
+        tolerance: (float) consider items to be on the same line if their
+            vertical coordinates do not differ more than this. Relevant
+            only if sort=True.
 
     Returns:
         the output of methods get_text_words / get_text_blocks or pymupdf.TextPage
@@ -502,10 +728,12 @@ def get_text(
             textpage=textpage,
             sort=sort,
             delimiters=delimiters,
+            tolerance=tolerance,
         )
     if option == "blocks":
         return get_text_blocks(
-            page, clip=clip, flags=flags, textpage=textpage, sort=sort
+            page, clip=clip, flags=flags, textpage=textpage, sort=sort,
+            tolerance=tolerance,
         )
 
     if option == "text" and sort:
@@ -535,13 +763,25 @@ def get_text(
         raise ValueError("not a textpage of this page")
     #pymupdf.log( '{option=}')
     if option == "json":
-        t = tp.extractJSON(cb=cb, sort=sort)
+        t = tp.extractJSON(cb=cb)
+        if sort:
+            d = json.loads(t)
+            _sort_dict_by_reading_order(d, tolerance)
+            t = json.dumps(d, separators=(",", ":"), indent=1)
     elif option == "rawjson":
-        t = tp.extractRAWJSON(cb=cb, sort=sort)
+        t = tp.extractRAWJSON(cb=cb)
+        if sort:
+            d = json.loads(t)
+            _sort_dict_by_reading_order(d, tolerance)
+            t = json.dumps(d, separators=(",", ":"), indent=1)
     elif option == "dict":
-        t = tp.extractDICT(cb=cb, sort=sort)
+        t = tp.extractDICT(cb=cb)
+        if sort:
+            _sort_dict_by_reading_order(t, tolerance)
     elif option == "rawdict":
-        t = tp.extractRAWDICT(cb=cb, sort=sort)
+        t = tp.extractRAWDICT(cb=cb)
+        if sort:
+            _sort_dict_by_reading_order(t, tolerance)
     elif option == "html":
         t = tp.extractHTML()
     elif option == "xml":

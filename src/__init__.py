@@ -25690,14 +25690,15 @@ def get_text(
         pages=None,
         method='single',
         concurrency=None,
-        
+
         option='text',
         clip=None,
         flags=None,
         textpage=None,
         sort=False,
         delimiters=None,
-        
+        tolerance=3,
+
         _stats=False,
         ):
     '''
@@ -25727,6 +25728,8 @@ def get_text(
         sort
         delimiters:
             Passed to internal calls to `Page.get_text()`.
+        tolerance:
+            Passed to internal calls to `Page.get_text()`.
     '''
     args_dict = dict(
             option=option,
@@ -25735,6 +25738,7 @@ def get_text(
             textpage=textpage,
             sort=sort,
             delimiters=delimiters,
+            tolerance=tolerance,
             )
     
     return apply_pages(
